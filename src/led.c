@@ -47,6 +47,13 @@ void restore_leds(device_t *state) {
     }
 }
 
+uint8_t toggle_led(void) {
+    uint8_t new_led_state = gpio_get(GPIO_LED_PIN) ^ 1;
+    gpio_put(GPIO_LED_PIN, new_led_state);
+
+    return new_led_state;
+}
+
 void blink_led(device_t *state) {
     /* Since LEDs might be ON previously, we go OFF, ON, OFF, ON, OFF */
     state->blinks_left     = 5;
@@ -66,8 +73,7 @@ void led_blinking_task(device_t *state) {
         return;
 
     /* Toggle the LED state */
-    uint8_t new_led_state = gpio_get(GPIO_LED_PIN) ^ 1;
-    gpio_put(GPIO_LED_PIN, new_led_state);
+    uint8_t new_led_state = toggle_led();
 
     /* Also keyboard leds (if it's connected locally) since on-board leds are not visible */
     leds = new_led_state * 0x07; /* Numlock, capslock, scrollock */

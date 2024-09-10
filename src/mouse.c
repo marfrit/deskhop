@@ -48,7 +48,7 @@ int32_t accelerate(int32_t offset) {
         {70, 4.0}, //    -------------------------------------------
     };             //        10    20    30    40    50    60    70
 
-    if (!ENABLE_ACCELERATION)
+    if (!global_state.config.enable_acceleration)
         return offset;
 
     for (int i = 0; i < 7; i++) {
@@ -73,8 +73,8 @@ void update_mouse_position(device_t *state, mouse_values_t *values) {
     int offset_y = accelerate(values->move_y) * (current->speed_y >> reduce_speed);
 
     /* Update movement */
-    state->mouse_x = move_and_keep_on_screen(state->mouse_x, offset_x);
-    state->mouse_y = move_and_keep_on_screen(state->mouse_y, offset_y);
+    state->pointer_x = move_and_keep_on_screen(state->pointer_x, offset_x);
+    state->pointer_y = move_and_keep_on_screen(state->pointer_y, offset_y);
 
     /* Update buttons state */
     state->mouse_buttons = values->buttons;
@@ -86,7 +86,7 @@ void output_mouse_report(mouse_report_t *report, device_t *state) {
         queue_mouse_report(report, state);
         state->last_activity[BOARD_ROLE] = time_us_64();
     } else {
-        send_packet((uint8_t *)report, MOUSE_REPORT_MSG, MOUSE_REPORT_LENGTH);
+        queue_packet((uint8_t *)report, MOUSE_REPORT_MSG, MOUSE_REPORT_LENGTH);
     }
 }
 
@@ -100,48 +100,54 @@ int16_t scale_y_coordinate(int screen_from, int screen_to, device_t *state) {
 
     /* If sizes match, there is nothing to do */
     if (size_from == size_to)
-        return state->mouse_y;
+        return state->pointer_y;
 
     /* Moving from smaller ==> bigger screen
        y_a = top + (((bottom - top) * y_b) / HEIGHT) */
 
     if (size_from > size_to) {
-        return to->border.top + ((size_to * state->mouse_y) / MAX_SCREEN_COORD);
+        return to->border.top + ((size_to * state->pointer_y) / MAX_SCREEN_COORD);
     }
 
     /* Moving from bigger ==> smaller screen
        y_b = ((y_a - top) * HEIGHT) / (bottom - top) */
 
-    if (state->mouse_y < from->border.top)
+    if (state->pointer_y < from->border.top)
         return MIN_SCREEN_COORD;
 
-    if (state->mouse_y > from->border.bottom)
+    if (state->pointer_y > from->border.bottom)
         return MAX_SCREEN_COORD;
 
-    return ((state->mouse_y - from->border.top) * MAX_SCREEN_COORD) / size_from;
+    return ((state->pointer_y - from->border.top) * MAX_SCREEN_COORD) / size_from;
 }
 
 void switch_screen(
     device_t *state, output_t *output, int new_x, int output_from, int output_to, int direction) {
-    mouse_report_t hidden_pointer = {.y = MIN_SCREEN_COORD, .x = MAX_SCREEN_COORD};
+    uint8_t *mouse_park_pos = &state->config.output[state->active_output].mouse_park_pos;
+
+    int16_t mouse_y = (*mouse_park_pos == 0) ? MIN_SCREEN_COORD : /* Top */
+                      (*mouse_park_pos == 1) ? MAX_SCREEN_COORD : /* Bottom */
+                                               state->pointer_y;  /* Previous */
+
+    mouse_report_t hidden_pointer = {.y = mouse_y, .x = MAX_SCREEN_COORD};
 
     output_mouse_report(&hidden_pointer, state);
     switch_output(state, output_to);
-    state->mouse_x = (direction == LEFT) ? MAX_SCREEN_COORD : MIN_SCREEN_COORD;
-    state->mouse_y = scale_y_coordinate(output->number, 1 - output->number, state);
+    state->pointer_x = (direction == LEFT) ? MAX_SCREEN_COORD : MIN_SCREEN_COORD;
+    state->pointer_y = scale_y_coordinate(output->number, 1 - output->number, state);
 }
 
 void switch_desktop(device_t *state, output_t *output, int new_index, int direction) {
-    /* Fix for MACOS: Send relative mouse movement here, one or two pixels in the 
+    /* Fix for MACOS: Send relative mouse movement here, one or two pixels in the
        direction of movement, BEFORE absolute report sets X to 0 */
     mouse_report_t move_relative_one
-        = {.x = (direction == LEFT) ? SCREEN_MIDPOINT - 2 : SCREEN_MIDPOINT + 2, .mode = RELATIVE};
+        = {.x = (direction == LEFT) ? -5 : 5, .mode = RELATIVE};
 
     switch (output->os) {
         case MACOS:
-            /* Once doesn't seem reliable enough, do it twice */
-            output_mouse_report(&move_relative_one, state);
-            output_mouse_report(&move_relative_one, state);
+            /* Once doesn't seem reliable enough, do it a few times */
+            for (int i = 0; i < 5; i++)
+                output_mouse_report(&move_relative_one, state);
             break;
 
         case WINDOWS:
@@ -150,13 +156,14 @@ void switch_desktop(device_t *state, output_t *output, int new_index, int direct
             break;
 
         case LINUX:
+        case ANDROID:
         case OTHER:
             /* Linux should treat all desktops as a single virtual screen, so you should leave
             screen_count at 1 and it should just work */
             break;
     }
 
-    state->mouse_x       = (direction == RIGHT) ? MIN_SCREEN_COORD : MAX_SCREEN_COORD;
+    state->pointer_x       = (direction == RIGHT) ? MIN_SCREEN_COORD : MAX_SCREEN_COORD;
     output->screen_index = new_index;
 }
 
@@ -169,16 +176,16 @@ void switch_desktop(device_t *state, output_t *output, int new_index, int direct
           )___(          )___(     |     )___(          )___(          )___(
 */
 void check_screen_switch(const mouse_values_t *values, device_t *state) {
-    int new_x        = state->mouse_x + values->move_x;
+    int new_x        = state->pointer_x + values->move_x;
     output_t *output = &state->config.output[state->active_output];
 
-    bool jump_left  = new_x < MIN_SCREEN_COORD - JUMP_THRESHOLD;
-    bool jump_right = new_x > MAX_SCREEN_COORD + JUMP_THRESHOLD;
+    bool jump_left  = new_x < MIN_SCREEN_COORD - state->config.jump_treshold;
+    bool jump_right = new_x > MAX_SCREEN_COORD + state->config.jump_treshold;
 
     int direction = jump_left ? LEFT : RIGHT;
 
-    /* No switching allowed if explicitly disabled or mouse button is held */
-    if (state->switch_lock || state->mouse_buttons)
+    /* No switching allowed if explicitly disabled */
+    if (state->switch_lock)
         return;
 
     /* No jump condition met == nothing to do, return */
@@ -187,9 +194,13 @@ void check_screen_switch(const mouse_values_t *values, device_t *state) {
 
     /* We want to jump in the direction of the other computer */
     if (output->pos != direction) {
-        if (output->screen_index == 1) /* We are at the border -> switch outputs */
-            switch_screen(state, output, new_x, state->active_output, 1 - state->active_output, direction);
+        if (output->screen_index == 1) { /* We are at the border -> switch outputs */
+            /* No switching allowed if mouse button is held. Should only apply to the border! */
+            if (state->mouse_buttons)
+                return;
 
+            switch_screen(state, output, new_x, state->active_output, 1 - state->active_output, direction);
+        }
         /* If here, this output has multiple desktops and we are not on the main one */
         else
             switch_desktop(state, output, output->screen_index - 1, direction);
@@ -200,9 +211,9 @@ void check_screen_switch(const mouse_values_t *values, device_t *state) {
         switch_desktop(state, output, output->screen_index + 1, direction);
 }
 
-void extract_report_values(uint8_t *raw_report, device_t *state, mouse_values_t *values) {
+void extract_report_values(uint8_t *raw_report, device_t *state, mouse_values_t *values, hid_interface_t *iface) {
     /* Interpret values depending on the current protocol used. */
-    if (state->mouse_dev.protocol == HID_PROTOCOL_BOOT) {
+    if (iface->protocol == HID_PROTOCOL_BOOT) {
         hid_mouse_report_t *mouse_report = (hid_mouse_report_t *)raw_report;
 
         values->move_x  = mouse_report->x;
@@ -213,40 +224,40 @@ void extract_report_values(uint8_t *raw_report, device_t *state, mouse_values_t 
     }
 
     /* If HID Report ID is used, the report is prefixed by the report ID so we have to move by 1 byte */
-    if (state->mouse_dev.uses_report_id)
+    if (iface->mouse.report_id)
         raw_report++;
 
-    values->move_x  = get_report_value(raw_report, &state->mouse_dev.move_x);
-    values->move_y  = get_report_value(raw_report, &state->mouse_dev.move_y);
-    values->wheel   = get_report_value(raw_report, &state->mouse_dev.wheel);
-    values->buttons = get_report_value(raw_report, &state->mouse_dev.buttons);
+    values->move_x  = get_report_value(raw_report, &iface->mouse.move_x);
+    values->move_y  = get_report_value(raw_report, &iface->mouse.move_y);
+    values->wheel   = get_report_value(raw_report, &iface->mouse.wheel);
+    values->buttons = get_report_value(raw_report, &iface->mouse.buttons);
 }
 
 mouse_report_t create_mouse_report(device_t *state, mouse_values_t *values) {
     mouse_report_t mouse_report = {
         .buttons = values->buttons,
-        .x       = state->mouse_x,
-        .y       = state->mouse_y,
+        .x       = state->pointer_x,
+        .y       = state->pointer_y,
         .wheel   = values->wheel,
         .mode    = ABSOLUTE,
     };
 
     /* Workaround for Windows multiple desktops */
     if (state->relative_mouse) {
-        mouse_report.x = SCREEN_MIDPOINT + values->move_x;
-        mouse_report.y = SCREEN_MIDPOINT + values->move_y;
+        mouse_report.x = values->move_x;
+        mouse_report.y = values->move_y;
         mouse_report.mode = RELATIVE;
-        mouse_report.buttons = values->buttons;
-        mouse_report.wheel = values->wheel;
     }
+
     return mouse_report;
 }
 
-void process_mouse_report(uint8_t *raw_report, int len, device_t *state) {
+void process_mouse_report(uint8_t *raw_report, int len, uint8_t itf, hid_interface_t *iface) {
     mouse_values_t values = {0};
+    device_t *state = &global_state;
 
     /* Interpret the mouse HID report, extract and save values we need. */
-    extract_report_values(raw_report, state, &values);
+    extract_report_values(raw_report, state, &values, iface);
 
     /* Calculate and update mouse pointer movement. */
     update_mouse_position(state, &values);
@@ -280,7 +291,11 @@ void process_mouse_queue_task(device_t *state) {
     if (tud_suspended())
         tud_remote_wakeup();
 
-    /* ... try sending it to the host, if it's successful */
+    /* If it's not ready, we'll try on the next pass */
+    if (!tud_hid_n_ready(ITF_NUM_HID))
+        return;
+
+    /* Try sending it to the host, if it's successful */
     bool succeeded = tud_mouse_report(report.mode, report.buttons, report.x, report.y, report.wheel);
 
     /* ... then we can remove it from the queue */
